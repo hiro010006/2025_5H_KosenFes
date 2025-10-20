@@ -107,6 +107,126 @@ def logger_worker(filename):
                 f.flush()
             time.sleep(0.2)
 
+# --- 追加: テーマ定義とユーティリティ ---
+
+class HUDTheme:
+    def __init__(self, name="neon_dark"):
+        if name == "neon_dark":
+            self.bg = QtGui.QColor(0, 0, 0, 255)
+            self.panel = QtGui.QColor(20, 20, 24, 200)
+            self.stroke = QtGui.QColor(220, 220, 230, 220)
+            self.hp_ok = QtGui.QColor(60, 220, 120)
+            self.hp_low = QtGui.QColor(255, 70, 70)
+            self.ammo = QtGui.QColor(240, 240, 240)
+            self.warn = QtGui.QColor(255, 100, 40)
+            self.accent = QtGui.QColor(120, 170, 255)  # ネオン青
+            self.glow = QtGui.QColor(120, 170, 255, 120)
+            self.shadow = QtGui.QColor(0, 0, 0, 160)
+            self.crosshair = QtGui.QColor(220, 220, 220, 200)
+        else:
+            # fallback
+            self.__init__("neon_dark")
+
+def ease_out_cubic(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return 1 - pow(1 - t, 3)
+
+class FPSMeter:
+    def __init__(self, n=60):
+        self.times = deque(maxlen=n)
+        self.last = time.time()
+    def tick(self):
+        now = time.time()
+        dt = now - self.last
+        self.last = now
+        self.times.append(dt)
+    def fps(self):
+        if not self.times:
+            return 0.0
+        avg = sum(self.times) / len(self.times)
+        return 1.0 / avg if avg > 0 else 0.0
+
+class DamageFlash:
+    """被弾時に画面端を赤くパルスする"""
+    def __init__(self, decay=0.7):
+        self.t0 = None
+        self.duration = 0.6
+        self.decay = decay
+    def trigger(self):
+        self.t0 = time.time()
+    def alpha(self):
+        if self.t0 is None:
+            return 0.0
+        t = (time.time() - self.t0) / self.duration
+        if t >= 1.0:
+            self.t0 = None
+            return 0.0
+        # 立ち上がり→減衰
+        return ease_out_cubic(1.0 - t) ** self.decay
+
+def draw_crosshair(p: QtGui.QPainter, cx, cy, size, color: QtGui.QColor, thick=2):
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.setPen(QtGui.QPen(color, thick, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    gap = int(size * 0.35)
+    for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+        x1 = cx + dx * gap
+        y1 = cy + dy * gap
+        x2 = cx + dx * size
+        y2 = cy + dy * size
+        p.drawLine(x1, y1, x2, y2)
+
+def draw_sensor_ring(p: QtGui.QPainter, cx, cy, r, hit_idx, theme: HUDTheme):
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    segs = 8
+    base_pen = QtGui.QPen(theme.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)  # 視認性↑なら太さ3
+    p.setPen(base_pen)
+
+    # 1/16度換算用係数
+    RAD2QT = 180.0 * 16.0 / np.pi
+
+    for i in range(segs):
+        a0 = (2*np.pi) * (i / segs)
+        a1 = (2*np.pi) * ((i+0.7) / segs)   # セグメント長
+        start16 = int(-a0 * RAD2QT)
+        span16  = int(-(a1 - a0) * RAD2QT)
+
+        p.setPen(base_pen)
+        p.drawArc(cx - r, cy - r, 2*r, 2*r, start16, span16)
+
+        if hit_idx is not None and i == hit_idx % segs:
+            glow = QtGui.QPen(theme.warn, 6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+            p.setPen(glow)
+            p.drawArc(cx - r, cy - r, 2*r, 2*r, start16, span16)
+
+
+def draw_ammo_icons(p: QtGui.QPainter, x, y, count, max_count, theme: HUDTheme, scale=1.0):
+    """丸弾アイコンを横並びで。残弾0はアウトラインのみ"""
+    size = int(18 * scale)
+    gap  = int(8 * scale)
+    for i in range(max_count):
+        rect = QtCore.QRect(x + i*(size+gap), y, size, size)
+        if i < count:
+            p.setBrush(QtGui.QBrush(theme.ammo))
+            p.setPen(QtGui.QPen(theme.shadow, 1))
+            p.drawEllipse(rect)
+        else:
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(QtGui.QPen(theme.ammo, 2))
+            p.drawEllipse(rect)
+
+def draw_glass_panel(p: QtGui.QPainter, x, y, w, h, theme: HUDTheme, r=12):
+    # ガラスっぽいパネル（グロー＋内側の薄いグラデ）
+    p.setPen(QtCore.Qt.NoPen)
+    grad = QtGui.QLinearGradient(x, y, x, y+h)
+    grad.setColorAt(0.0, QtGui.QColor(255,255,255,22))
+    grad.setColorAt(1.0, QtGui.QColor(255,255,255,6))
+    p.setBrush(QtGui.QBrush(grad))
+    p.drawRoundedRect(x, y, w, h, r, r)
+    # 外枠
+    p.setPen(QtGui.QPen(theme.stroke, 2))
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.drawRoundedRect(x, y, w, h, r, r)
+
 # GUIアプリ
 class MonitorWindow(QtWidgets.QWidget):
     def __init__(self):
@@ -136,6 +256,11 @@ class MonitorWindow(QtWidgets.QWidget):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(int(1000 / FPS))
+
+        self.theme = HUDTheme("neon_dark")
+        self.fpsm = FPSMeter(90)
+        self.flash = DamageFlash(decay=0.9)
+        self._last_hit_seen = None
 
         # カメラ/ストリーム初期化（OpenCV）
         if RTSP_URL:
@@ -190,22 +315,6 @@ class MonitorWindow(QtWidgets.QWidget):
         cv2.putText(frame, ammo_text, (bar_x, bar_y+bar_h+30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240,240,200), 2, cv2.LINE_AA)
 
-        # --- 接続状態／Ping ---
-        conn_text = "Connected" if st.get("connected") else "Disconnected"
-        ping = st.get("ping_ms")
-        ping_text = f"Ping: {ping} ms" if ping is not None else ""
-        cv2.putText(frame, f"{conn_text}  {ping_text}", (w-420, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
-
-        # --- 試合時間 ---
-        elapsed = int(time.time() - self.match_start_ts) if self.match_running else 0
-        remaining = max(0, self.match_total_sec - elapsed)
-        mm = remaining // 60
-        ss = remaining % 60
-        time_text = f"Time: {mm:02d}:{ss:02d} / {self.match_total_sec//60:02d}:{self.match_total_sec%60:02d}"
-        cv2.putText(frame, time_text, (w-420, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
-
         # --- 最後の被弾センサを一瞬表示（赤い閃光） ---
         last_hit = st.get("last_hit")
         if last_hit is not None:
@@ -229,6 +338,7 @@ class MonitorWindow(QtWidgets.QWidget):
         return frame
 
     def update_frame(self):
+        t0 = time.time()
         # --- フレーム取得 ---
         if self.cap:
             ret, frame = self.cap.read()
@@ -340,6 +450,12 @@ class MonitorWindow(QtWidgets.QWidget):
         painter.setPen(QtGui.QPen(QtGui.QColor(220,220,220)))
         painter.drawText(big_w - int(460 * scale_factor), int(40 * scale_factor), f"{conn_text}  {ping_text}")
 
+        # --- 試合時間（cv2 直描き） ---
+        elapsed = int(time.time() - self.match_start_ts) if self.match_running else 0
+        remaining = max(0, self.match_total_sec - elapsed)
+        mm, ss = divmod(remaining, 60)
+        time_text = f"Time: {mm:02d}:{ss:02d} / {self.match_total_sec//60:02d}:{self.match_total_sec%60:02d}"
+
         # --- 最後の被弾表示（円）---
         last_hit = st_copy.get("last_hit")
         if last_hit is not None:
@@ -356,6 +472,70 @@ class MonitorWindow(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor(255,255,255)))
             painter.setFont(QtGui.QFont(font_name, int(14 * scale_factor)))
             painter.drawText(sx - 36 * scale_factor, sy - 44 * scale_factor, f"Hit #{last_hit}")
+        
+        # ======= ここから “見た目強化” HUD まとめて描く =======
+        theme = self.theme
+
+        # 左上：HP/Ammoパネル（ガラス調）
+        panel_x = 30 * scale_factor
+        panel_y = 26 * scale_factor
+        panel_w = int(w * 0.44) * scale_factor
+        panel_h = 92 * scale_factor
+        painter.setOpacity(0.95)
+        draw_glass_panel(painter, panel_x-8, panel_y-12, panel_w+16, panel_h+24, theme)  # ← grass→glass に修正
+
+        # 既存HPバーの上にやわグロー
+        painter.setOpacity(0.25)
+        painter.setBrush(theme.glow)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 8 * scale_factor, 8 * scale_factor)
+        painter.setOpacity(1.0)
+
+        # 弾をアイコンでも表示（テキストは併記のままでOK）
+        ammo_count = int(st_copy.get('ammo',0))
+        ammo_max = int(st_copy.get('max_ammo',5))
+        draw_ammo_icons(painter, ammo_x, ammo_y - 20*scale_factor, ammo_count, ammo_max, theme, scale=1.0*scale_factor)
+
+        # 右上：接続/ Ping / 試合時間のパネル
+        right_panel_w = int(420 * scale_factor)
+        right_panel_h = int(70 * scale_factor)
+        right_panel_x = big_w - right_panel_w - 30*scale_factor
+        right_panel_y = 22 * scale_factor
+        draw_glass_panel(painter, right_panel_x, right_panel_y, right_panel_w, right_panel_h, theme)
+        painter.setPen(QtGui.QPen(theme.stroke))
+        painter.setFont(QtGui.QFont(font_name, int(16 * scale_factor)))
+        painter.drawText(right_panel_x + 16*scale_factor, right_panel_y + 26*scale_factor, f"{conn_text}   {ping_text}")
+        painter.drawText(right_panel_x + 16*scale_factor, right_panel_y + 52*scale_factor, time_text)
+
+        # 中央：照準＋被弾方向リング
+        cx, cy = (w // 2) * scale_factor, (h // 2) * scale_factor
+        draw_crosshair(painter, cx, cy, int(22*scale_factor), theme.crosshair, thick=2*scale_factor)
+        draw_sensor_ring(painter, cx, cy, int(min(w,h)*0.23)*scale_factor, st_copy.get("last_hit"), theme)
+
+        # 被弾トリガ
+        if st_copy.get("last_hit") is not None and st_copy.get("last_hit") != self._last_hit_seen:
+            self._last_hit_seen = st_copy.get("last_hit")
+            self.flash.trigger()
+
+        # 画面端の赤パルス
+        a = self.flash.alpha()
+        if a > 0.0:
+            painter.setOpacity(0.35 * a)
+            painter.setBrush(QtGui.QBrush(theme.warn))
+            painter.setPen(QtCore.Qt.NoPen)
+            margin = int(8 * scale_factor)
+            painter.drawRect(0, 0, big_w, margin)
+            painter.drawRect(0, big_h - margin, big_w, margin)
+            painter.drawRect(0, 0, margin, big_h)
+            painter.drawRect(big_w - margin, 0, margin, big_h)
+            painter.setOpacity(1.0)
+
+        # 左下：FPS
+        self.fpsm.tick()
+        fps_text = f"{self.fpsm.fps():.0f} FPS"
+        painter.setPen(QtGui.QPen(theme.stroke))
+        painter.setFont(QtGui.QFont(font_name, int(14*scale_factor)))
+        painter.drawText(24*scale_factor, big_h - 18*scale_factor, fps_text)
 
         painter.end()
 
@@ -409,3 +589,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
