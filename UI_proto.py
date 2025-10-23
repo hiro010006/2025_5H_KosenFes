@@ -147,27 +147,30 @@ def logger_worker(filename):
 class HUDTheme:
     def __init__(self, name="neon_dark"):
         if name == "neon_dark":
-            self.font_title  = QtGui.QFont("Noto Sans", 18)
-            self.font_body   = QtGui.QFont("Noto Sans", 14)
-            self.font_small  = QtGui.QFont("Noto Sans", 12)
-            self.pen_stroke  = QtGui.QPen(self.theme.stroke)
-            self.pen_warn    = QtGui.QPen(self.theme.warn, 6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-            self.pen_accent  = QtGui.QPen(self.theme.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-
-            self.bg = QtGui.QColor(0, 0, 0, 255)
-            self.panel = QtGui.QColor(20, 20, 24, 200)
-            self.stroke = QtGui.QColor(220, 220, 230, 220)
-            self.hp_ok = QtGui.QColor(60, 220, 120)
-            self.hp_low = QtGui.QColor(255, 70, 70)
-            self.ammo = QtGui.QColor(240, 240, 240)
-            self.warn = QtGui.QColor(255, 100, 40)
-            self.accent = QtGui.QColor(120, 170, 255)  # ネオン青
-            self.glow = QtGui.QColor(120, 170, 255, 120)
-            self.shadow = QtGui.QColor(0, 0, 0, 160)
+            # ① まず色
+            self.bg      = QtGui.QColor(0, 0, 0, 255)
+            self.panel   = QtGui.QColor(20, 20, 24, 200)
+            self.stroke  = QtGui.QColor(220, 220, 230, 220)
+            self.hp_ok   = QtGui.QColor(60, 220, 120)
+            self.hp_low  = QtGui.QColor(255, 70, 70)
+            self.ammo    = QtGui.QColor(240, 240, 240)
+            self.warn    = QtGui.QColor(255, 100, 40)
+            self.accent  = QtGui.QColor(120, 170, 255)
+            self.glow    = QtGui.QColor(120, 170, 255, 120)
+            self.shadow  = QtGui.QColor(0, 0, 0, 160)
             self.crosshair = QtGui.QColor(220, 220, 220, 200)
+
+            # ② 次にフォント/ペン（色を参照）
+            self.font_title = QtGui.QFont("Noto Sans", 18)
+            self.font_body  = QtGui.QFont("Noto Sans", 14)
+            self.font_small = QtGui.QFont("Noto Sans", 12)
+
+            self.pen_stroke = QtGui.QPen(self.stroke)
+            self.pen_warn   = QtGui.QPen(self.warn,   6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+            self.pen_accent = QtGui.QPen(self.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
         else:
-            # fallback
             self.__init__("neon_dark")
+
 
 def ease_out_cubic(t: float) -> float:
     t = max(0.0, min(1.0, t))
@@ -378,6 +381,12 @@ class MonitorWindow(QtWidgets.QWidget):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180,180,180), 1, cv2.LINE_AA)
 
         return frame
+    
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        if e.key() == QtCore.Qt.Key_F11:
+            self.setWindowState(self.windowState() ^ QtCore.Qt.WindowFullScreen)
+        elif e.key() == QtCore.Qt.Key_Escape:
+            self.close()
 
     def update_frame(self):
         t0 = time.time()
@@ -468,9 +477,8 @@ class MonitorWindow(QtWidgets.QWidget):
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255)))
         painter.drawPath(path)
 
-        # update_frame 内
-        painter.setPen(self.pen_stroke)
-        painter.setFont(self.font_body) 
+        painter.setPen(self.theme.pen_stroke)
+        painter.setFont(self.theme.font_body)
 
         # --- Ammo（少し小さいフォント）---
         font_ammo = QtGui.QFont(font_name, ammo_font_size)
@@ -621,13 +629,6 @@ class MonitorWindow(QtWidgets.QWidget):
                     f"<b>Conn</b>: {conn_text_short} ({ping_str}) &nbsp;&nbsp;"
                     f"<b>LastHit</b>: {last_hit}")
         self.info_label.setText(info_html)
-
-def keyPressEvent(self, e):
-    if e.key()==QtCore.Qt.Key_F11:
-        self.setWindowState(self.windowState() ^ QtCore.Qt.WindowFullScreen)
-    elif e.key()==QtCore.Qt.Key_Escape:
-        self.close()
-
 
 def main():
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
