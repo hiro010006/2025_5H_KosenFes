@@ -147,6 +147,13 @@ def logger_worker(filename):
 class HUDTheme:
     def __init__(self, name="neon_dark"):
         if name == "neon_dark":
+            self.font_title  = QtGui.QFont("Noto Sans", 18)
+            self.font_body   = QtGui.QFont("Noto Sans", 14)
+            self.font_small  = QtGui.QFont("Noto Sans", 12)
+            self.pen_stroke  = QtGui.QPen(self.theme.stroke)
+            self.pen_warn    = QtGui.QPen(self.theme.warn, 6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+            self.pen_accent  = QtGui.QPen(self.theme.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+
             self.bg = QtGui.QColor(0, 0, 0, 255)
             self.panel = QtGui.QColor(20, 20, 24, 200)
             self.stroke = QtGui.QColor(220, 220, 230, 220)
@@ -461,6 +468,10 @@ class MonitorWindow(QtWidgets.QWidget):
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255)))
         painter.drawPath(path)
 
+        # update_frame 内
+        painter.setPen(self.pen_stroke)
+        painter.setFont(self.font_body) 
+
         # --- Ammo（少し小さいフォント）---
         font_ammo = QtGui.QFont(font_name, ammo_font_size)
         font_ammo.setStyleStrategy(QtGui.QFont.PreferAntialias)
@@ -610,6 +621,12 @@ class MonitorWindow(QtWidgets.QWidget):
                     f"<b>Conn</b>: {conn_text_short} ({ping_str}) &nbsp;&nbsp;"
                     f"<b>LastHit</b>: {last_hit}")
         self.info_label.setText(info_html)
+
+def keyPressEvent(self, e):
+    if e.key()==QtCore.Qt.Key_F11:
+        self.setWindowState(self.windowState() ^ QtCore.Qt.WindowFullScreen)
+    elif e.key()==QtCore.Qt.Key_Escape:
+        self.close()
 
 
 def main():
