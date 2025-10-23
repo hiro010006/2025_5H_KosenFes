@@ -14,7 +14,42 @@ from datetime import datetime
 import numpy as np
 import cv2
 
+# --- Ensure Qt platform plugin path (Qt5/Qt both) ---
+import os, sys
+def _setup_qt_plugin_path():
+    # 候補ベース（venvのsite-packages / パッケージ実体の両方を探す）
+    cands = []
+    sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "PyQt5")
+    for d in ("Qt5", "Qt"):
+        p = os.path.join(sp, d)
+        if os.path.isdir(p): cands.append(p)
+    try:
+        import PyQt5, importlib, inspect
+        pkgdir = os.path.dirname(PyQt5.__file__)
+        for d in ("Qt5", "Qt"):
+            p = os.path.join(pkgdir, d)
+            if os.path.isdir(p): cands.append(p)
+    except Exception:
+        pass
+
+    # 候補から qwindows.dll がある場所を決め打ち
+    for base in cands:
+        platforms = os.path.join(base, "plugins", "platforms")
+        bin_dir   = os.path.join(base, "bin")
+        if os.path.exists(os.path.join(platforms, "qwindows.dll")):
+            os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", platforms)
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+            return True
+    return False
+
+_setup_qt_plugin_path()
+
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+_pp = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH", "")
+if _pp:
+    QtCore.QCoreApplication.addLibraryPath(os.path.dirname(_pp))   # plugins/
+    QtCore.QCoreApplication.addLibraryPath(_pp)
 
 # ------------- 設定 -------------
 UDP_IP = "0.0.0.0"
@@ -263,7 +298,7 @@ class MonitorWindow(QtWidgets.QWidget):
         self._last_hit_seen = None
 
         # カメラ/ストリーム初期化（OpenCV）
-        if RTSP_URL:
+        if RTSP_URL is not None:
             self.cap = cv2.VideoCapture(RTSP_URL)
         else:
             self.cap = None  # 黒背景で描画
@@ -358,7 +393,7 @@ class MonitorWindow(QtWidgets.QWidget):
         h, w, ch = rgb.shape
 
         # --- スーパーサンプリング倍率（2または3を試す） ---
-        scale_factor = 2  # 2でまず試し、重ければ1に。よりシャープなら3を試す
+        scale_factor = 1  # 2でまず試し、重ければ1に。よりシャープなら3を試す
         big_w, big_h = w * scale_factor, h * scale_factor
 
         # --- 作業用 QImage（高品質フォーマット） ---
@@ -442,7 +477,7 @@ class MonitorWindow(QtWidgets.QWidget):
         painter.setPen(QtCore.Qt.NoPen)
         painter.drawPath(path2)
 
-        # --- 接続状態・Ping（右上）---
+        """  --- 接続状態・Ping（右上）---
         painter.setFont(QtGui.QFont(font_name, int(16 * scale_factor)))
         conn_text = "Connected" if st_copy.get("connected") else "Disconnected"
         ping_val = st_copy.get("ping_ms")
@@ -450,6 +485,7 @@ class MonitorWindow(QtWidgets.QWidget):
         painter.setPen(QtGui.QPen(QtGui.QColor(220,220,220)))
         painter.drawText(big_w - int(460 * scale_factor), int(40 * scale_factor), f"{conn_text}  {ping_text}")
 
+        """
         # --- 試合時間（cv2 直描き） ---
         elapsed = int(time.time() - self.match_start_ts) if self.match_running else 0
         remaining = max(0, self.match_total_sec - elapsed)
@@ -496,6 +532,10 @@ class MonitorWindow(QtWidgets.QWidget):
         ammo_max = int(st_copy.get('max_ammo',5))
         draw_ammo_icons(painter, ammo_x, ammo_y - 20*scale_factor, ammo_count, ammo_max, theme, scale=1.0*scale_factor)
 
+        conn_text = "Connected" if st_copy.get("connected") else "Disconnected"
+        ping_val = st_copy.get("ping_ms")
+        ping_text = f"Ping: {ping_val} ms" if ping_val is not None else "Ping: --"
+
         # 右上：接続/ Ping / 試合時間のパネル
         right_panel_w = int(420 * scale_factor)
         right_panel_h = int(70 * scale_factor)
@@ -509,8 +549,11 @@ class MonitorWindow(QtWidgets.QWidget):
 
         # 中央：照準＋被弾方向リング
         cx, cy = (w // 2) * scale_factor, (h // 2) * scale_factor
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         draw_crosshair(painter, cx, cy, int(22*scale_factor), theme.crosshair, thick=2*scale_factor)
         draw_sensor_ring(painter, cx, cy, int(min(w,h)*0.23)*scale_factor, st_copy.get("last_hit"), theme)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
 
         # 被弾トリガ
         if st_copy.get("last_hit") is not None and st_copy.get("last_hit") != self._last_hit_seen:
@@ -560,6 +603,7 @@ class MonitorWindow(QtWidgets.QWidget):
 
         # --- info_label 更新（元の HTML 表示維持） ---
         conn_text_short = "OK" if st_copy.get("connected") else "NO"
+        ping_val = st_copy.get("ping_ms")
         ping_str = f"{ping_val}ms" if ping_val is not None else "--"
         info_html = (f"<b>HP</b>: {st_copy.get('hp')}/{st_copy.get('max_hp')} &nbsp;&nbsp;"
                     f"<b>Ammo</b>: {st_copy.get('ammo')}/{st_copy.get('max_ammo')} &nbsp;&nbsp;"
