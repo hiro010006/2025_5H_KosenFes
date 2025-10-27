@@ -1,4 +1,10 @@
-# ── run_ui.ps1 ─────────────────────────────────────────────
+# ── run_ui.ps1（Qtに触らない確実版）──────────────────
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# 0) スクリプトの場所に固定（相対パス事故防止）
+Set-Location $PSScriptRoot
+
 # 1) venv 作成 & 有効化
 if (-not (Test-Path ".\.venv\Scripts\Activate.ps1")) {
   Write-Host "[setup] create venv (.venv)"
@@ -6,33 +12,23 @@ if (-not (Test-Path ".\.venv\Scripts\Activate.ps1")) {
 }
 . .\.venv\Scripts\Activate.ps1
 
-# 2) 依存チェック（pip show で判定）
+# 2) 依存チェック
 function Install-PythonPackageIfMissing {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory=$true)][string]$Name
-  )
+  param([Parameter(Mandatory=$true)][string]$Name)
   $info = & pip show $Name 2>$null
-  if (-not $info) {
-    Write-Host "[pip] install $Name"
-    pip install --no-cache-dir $Name
-  } else {
-    Write-Host "[pip] ok $Name"
-  }
+  if (-not $info) { Write-Host "[pip] install $Name"; pip install --no-cache-dir $Name }
+  else { Write-Host "[pip] ok $Name" }
 }
+Install-PythonPackageIfMissing numpy
+Install-PythonPackageIfMissing PyQt5
+Install-PythonPackageIfMissing opencv-python-headless
 
-Install-PythonPackageIfMissing -Name numpy
-Install-PythonPackageIfMissing -Name PyQt5
-Install-PythonPackageIfMissing -Name opencv-python-headless
-
-# Qt plugin パス保険（Qt5優先→Qt）
-$base = Join-Path $PSScriptRoot ".venv\Lib\site-packages\PyQt5\Qt5"
-if (-not (Test-Path $base)) { $base = Join-Path $PSScriptRoot ".venv\Lib\site-packages\PyQt5\Qt" }
-$env:QT_QPA_PLATFORM_PLUGIN_PATH = (Join-Path $base "plugins\platforms")
-$env:PATH = (Join-Path $base "bin") + ";" + $env:PATH
+# 3) Qtの環境変数は触らない（前の名残を消す）
+Remove-Item Env:QT_QPA_PLATFORM_PLUGIN_PATH -ErrorAction SilentlyContinue
 Remove-Item Env:QT_PLUGIN_PATH -ErrorAction SilentlyContinue
 
-
-# 3) 起動（QtパスはUI_proto.py側で自動解決する構成）
-python .\UI_proto.py
-# ───────────────────────────────────────────────────────────
+# 4) 出力バッファ無効化して実行（←手動で動いたのと同じコマンド）
+$env:PYTHONUNBUFFERED = "1"
+Write-Host "[run] .\.venv\Scripts\python.exe -X faulthandler -u .\UI_proto.py"
+.\.venv\Scripts\python.exe -X faulthandler -u .\UI_proto.py
+# ─────────────────────────────────────────────────────
