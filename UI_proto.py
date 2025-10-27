@@ -56,12 +56,13 @@ _fix_qt_plugin_path()
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # --- Safe font loader (Qt5×可変フォント落ち対策) ---
-def safe_add_font(path: str) -> str | None:
+def safe_add_font(path: str):
     try:
         if not os.path.exists(path):
             return None
-        # Qt5は VariableFont 系で落ちることがあるので回避
-        if "variablefont" in os.path.basename(path).lower():
+        # Qt5 は VariableFont で落ちやすいので一旦スキップ
+        base = os.path.basename(path).lower()
+        if "variablefont" in base:
             return None
         fid = QtGui.QFontDatabase.addApplicationFont(path)
         if fid == -1:
@@ -70,6 +71,19 @@ def safe_add_font(path: str) -> str | None:
         return fams[0] if fams else None
     except Exception:
         return None
+
+BASE_DIR = os.path.dirname(__file__)
+# ← ここを貼り替え
+FONT_HEAD = (
+    safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf"))
+    or safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Bold.ttf"))
+    or "Arial"
+)
+FONT_NUM  = (
+    safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "RobotoMono-Regular.ttf"))
+    or "Consolas"
+)
+
 
 BASE_DIR = os.path.dirname(__file__)
 FONT_HEAD = safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf")) or "Arial"
@@ -86,10 +100,14 @@ FRAME_W, FRAME_H = 1280, 720
 FPS = 30
 # -------------------------------------------------
 
+# === UI表示フラグ（上パネルを一時的にオフ） ===
+SHOW_TOP_LEFT  = False
+SHOW_TOP_RIGHT = False
+
 # 共有ステート
 state_lock = threading.Lock()
 state = {
-    "hp": 100, "max_hp": 100,
+    "hp": 1000, "max_hp": 1000,
     "ammo": 5, "max_ammo": 5,
     "sensors": [0]*8,
     "last_hit": None,
@@ -228,6 +246,8 @@ class MonitorWindow(QtWidgets.QWidget):
         self.video_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.info_label  = QtWidgets.QLabel(alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.info_label.setFixedHeight(80); self.info_label.setFont(QtGui.QFont("Arial", 11))
+        # Bottom panels と重ならないよう非表示（四隅レイアウト時）
+        self.info_label.setVisible(False)
 
         v = QtWidgets.QVBoxLayout(self); v.addWidget(self.video_label,1); v.addWidget(self.info_label)
 
@@ -263,112 +283,37 @@ class MonitorWindow(QtWidgets.QWidget):
 
         t = self.theme
 
-        # ---------- 左上: ULTRAスリムHP + 右上テイスト一致パネル ----------
-        max_hp = st.get("max_hp",100); hp = max(0,min(int(st.get("hp",0)), max_hp))
-        hp_ratio = (hp/float(max_hp)) if max_hp>0 else 0.0
-        left_w = int(w*0.42)*scale; left_h = int(64*scale); left_x = 30*scale; left_y = 26*scale
-        panel_rect = QtCore.QRect(left_x, left_y, left_w, left_h)
+        # (disabled) 左上パネルは非表示にしました。
+# if SHOW_TOP_LEFT:
+#     # ← ここに左上パネル描画（無効化中）
+#     pass
 
-        # パネル下地＋角金具
-        p.setOpacity(0.92); p.setPen(QtGui.QPen(t.stroke,1)); p.setBrush(QtGui.QColor(10,12,18,200))
-        p.drawRoundedRect(panel_rect, 8*scale, 8*scale)
-        draw_corner_brackets(p, panel_rect.x(), panel_rect.y(), panel_rect.width(), panel_rect.height(), t.stroke, len_px=14*scale, thick=2)
-        p.setOpacity(1.0)
+# (disabled) 右上パネルは非表示にしました。
+# if SHOW_TOP_RIGHT:
+#     # ← ここに右上パネル描画（無効化中）
+#     pass
 
-        # === AC風ラインゲージ（AP表示＋極細バー） =========================
-        max_hp = st.get("max_hp", 100)
-        hp = max(0, min(int(st.get("hp", 0)), max_hp))
-        ratio = (hp / float(max_hp)) if max_hp > 0 else 0.0
+        # --- 四隅展開：左下・右下にも同デザインを配置 ---
+        margin = int(26 * scale)
+        left_size  = QtCore.QSize(int(w * 0.42) * scale, int(64 * scale))
+        right_size = QtCore.QSize(int(440 * scale),     int(86 * scale))
 
-        # パネルは既存panel_rectをそのまま使用
-        # ラベル・数字の行位置を決める
-        # 位置決め（APをバーすれすれ／HP表記は少し上へ）
-        # 位置決め（APはバーすれすれ、数字はさらに上へ）
-        bar_y   = panel_rect.y() + int(28 * scale)   # ← バーの高さは据え置き
-        label_y = bar_y - int(1 * scale)             # ← "AP" ラベル：バーすれすれ
-        num_y   = bar_y - int(20 * scale)            # ← 5桁の数字をさらに上へ（元: 12）
+        rect_bl_left  = QtCore.QRect(margin, big_h - margin - left_size.height(),
+                                     left_size.width(), left_size.height())
+        rect_br_right = QtCore.QRect(big_w - margin - right_size.width(),
+                                     big_h - margin - right_size.height(),
+                                     right_size.width(), right_size.height())
 
-
-
-        # 左: "AP" ラベル（細め）
-        p.setFont(QtGui.QFont(FONT_HEAD, int(12 * scale)))
-        p.setPen(t.stroke)
-        p.drawText(panel_rect.x() + int(12 * scale), label_y, "AP")
-
-        # 右: 5桁ゼロパディングの数値（等幅・やや大きめ）
-        ap_font = QtGui.QFont(FONT_NUM, int(22 * scale))
-        ap_font.setStyleStrategy(QtGui.QFont.PreferAntialias)
-        p.setFont(ap_font)
-        ap_text = f"{hp:05d}"   # 08954 みたいな見え方
-        # 薄いアウトライン
-        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 2))
-        p.drawText(panel_rect.x() + panel_rect.width() - int(120 * scale), num_y,
-                   int(110 * scale), int(24 * scale),
-                   QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, ap_text)
-        # 本文（やや青みがかった白）
-        p.setPen(QtGui.QPen(QtGui.QColor(230, 240, 255), 1))
-        p.drawText(panel_rect.x() + panel_rect.width() - int(120 * scale), num_y,
-                   int(110 * scale), int(24 * scale),
-                   QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, ap_text)
-
-        # --- 極細バー本体（水平ライン＋ラウンド端） ---
-        bar_x = panel_rect.x() + int(12 * scale)
-        bar_w = panel_rect.width() - int(24 * scale)
-        y_mid = bar_y + int(8 * scale)  # バー中心ライン
-
-        # トラック（下地）…薄いシルバー
-        track_pen = QtGui.QPen(QtGui.QColor(160, 170, 180, 140), 2 * scale,
-                               QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-        p.setPen(track_pen)
-        p.drawLine(bar_x, y_mid, bar_x + bar_w, y_mid)
-
-        # 進捗ライン…白→シアン寄り、端は丸
-        prog_len = int(bar_w * ratio)
-        # ほんのりグロー（下に太い半透明）
-        glow_pen = QtGui.QPen(QtGui.QColor(120, 170, 255, 70), 6 * scale,
-                              QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-        p.setPen(glow_pen)
-        p.drawLine(bar_x, y_mid, bar_x + prog_len, y_mid)
-        # 本体ライン
-        prog_pen = QtGui.QPen(QtGui.QColor(220, 240, 255), 3 * scale,
-                      QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-        p.setPen(prog_pen)
-        p.drawLine(bar_x, y_mid, bar_x + prog_len, y_mid)
-
-        # HP低下時はラインをアンバーに寄せる（30%未満で色替え＋軽い点滅）
-        if max_hp > 0 and hp / max_hp < 0.30:
-            phase = (time.time() * 2.0) % 1.0
-            alpha = 0.55 + 0.45 * (1.0 if phase < 0.5 else 0.0)
-            amb_glow = QtGui.QPen(QtGui.QColor(255, 160, 90, int(60 * alpha)), 6 * scale,
-                                  QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-            amb_line = QtGui.QPen(QtGui.QColor(255, 200, 150, int(255 * alpha)), 3 * scale,
-                                  QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
-            p.setPen(amb_glow); p.drawLine(bar_x, y_mid, bar_x + prog_len, y_mid)
-            p.setPen(amb_line); p.drawLine(bar_x, y_mid, bar_x + prog_len, y_mid)
-
-        
-        # 下辺ドット仕切りは既存のまま（右上と合わせる）
-        # draw_dotted_divider(...) を panel_rect の下辺に描いているはず
-
-
-        # ---------- 右上: 情報パネル ----------
-        elapsed = int(time.time()-self.match_start_ts) if self.match_running else 0
-        rem = max(0, self.match_total_sec - elapsed); mm, ss = divmod(rem, 60)
-        time_text = f"{mm:02d}:{ss:02d} / {self.match_total_sec//60:02d}:{self.match_total_sec%60:02d}"
-        conn_text = "Connected" if st.get("connected") else "Disconnected"
-        ping = st.get("ping_ms"); ping_text = f"PING {ping}ms" if ping is not None else "PING --ms"
-
-        right_w = int(440*scale); right_h = int(86*scale); right_x = big_w-right_w-30*scale; right_y = 22*scale
-        rp = QtCore.QRect(right_x,right_y,right_w,right_h)
-        p.setOpacity(0.92); p.setPen(QtGui.QPen(t.stroke,1)); p.setBrush(QtGui.QColor(10,12,18,200)); p.drawRoundedRect(rp,8*scale,8*scale)
-        draw_corner_brackets(p, rp.x(), rp.y(), rp.width(), rp.height(), t.stroke, len_px=14*scale, thick=2)
-        p.setOpacity(1.0)
-        p.setPen(t.stroke); p.setFont(t.font_small)
-        p.drawText(rp.x()+16*scale, rp.y()+26*scale, "LINK:"); p.drawText(rp.x()+16*scale, rp.y()+50*scale, "TIME:")
-        p.setFont(t.font_num)
-        p.drawText(rp.x()+72*scale, rp.y()+26*scale, f"{conn_text}   {ping_text}")
-        p.drawText(rp.x()+72*scale, rp.y()+50*scale, time_text)
-        draw_dotted_divider(p, rp.x()+12*scale, rp.y()+rp.height()-12*scale, rp.x()+rp.width()-12*scale, t.stroke, dash=4, gap=4, thick=1)
+        render_left_status(p, rect_bl_left,  st, t, scale)
+        render_right_info(p, rect_br_right, st, t, scale, self.match_total_sec, self.match_start_ts, self.match_running)
+        # 右下パネル内にFPSを表示
+        p.setPen(t.pen_stroke)
+        p.setFont(QtGui.QFont(FONT_NUM, int(14*scale)))
+        fps_rect = QtCore.QRect(rect_br_right.x()+12*scale,
+                                 rect_br_right.y()+rect_br_right.height()-int(28*scale),
+                                 rect_br_right.width()-24*scale,
+                                 int(22*scale))
+        p.drawText(fps_rect, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{int(FPS)} FPS")
 
         # 未接続トースト
         if not st.get("connected"):
@@ -392,8 +337,7 @@ class MonitorWindow(QtWidgets.QWidget):
         # スキャンライン & 右下FPS
         draw_scanlines(p, big_w, big_h, alpha=12)
         p.setPen(t.pen_stroke); p.setFont(QtGui.QFont(FONT_NUM, int(14*scale)))
-        p.drawText(24*scale, big_h-18*scale, f"{int(FPS)} FPS")
-
+        
         p.end()
         pix = QtGui.QPixmap.fromImage(big_img)
         try: dpr = self.devicePixelRatioF()
@@ -405,6 +349,95 @@ class MonitorWindow(QtWidgets.QWidget):
         # 下のインフォ行（簡易）
         conn_short = "OK" if st.get("connected") else "NO"; ping_str = f"{st.get('ping_ms')}ms" if st.get("ping_ms") is not None else "--"
         self.info_label.setText(f"<b>HP</b>: {st.get('hp')}/{st.get('max_hp')} &nbsp;&nbsp; <b>Ammo</b>: {st.get('ammo')}/{st.get('max_ammo')} &nbsp;&nbsp; <b>Conn</b>: {conn_short} ({ping_str}) &nbsp;&nbsp; <b>LastHit</b>: {st.get('last_hit')}")
+
+# ── AC風 左パネル（APゲージ＋AMMO）を描く ─────────────────
+def render_left_status(p, rect: QtCore.QRect, st, t, scale):
+    # 下地＋角金具
+    p.setOpacity(0.92)
+    p.setPen(QtGui.QPen(t.stroke, 1)); p.setBrush(QtGui.QColor(10,12,18,200))
+    p.drawRoundedRect(rect, 8*scale, 8*scale)
+    draw_corner_brackets(p, rect.x(), rect.y(), rect.width(), rect.height(), t.stroke, len_px=14*scale, thick=2)
+    p.setOpacity(1.0)
+
+    # HP/比率
+    max_hp = st.get("max_hp", 1000)
+    hp     = max(0, min(int(st.get("hp", 0)), max_hp))
+    ratio  = (hp/float(max_hp)) if max_hp>0 else 0.0
+
+    # 位置決め（“APすれすれ/数字は少し上”のやつ）
+    bar_y   = rect.y() + int(28 * scale)
+    label_y = bar_y - int(1 * scale)
+    num_y   = bar_y - int(20 * scale)
+
+    # APラベル
+    p.setFont(QtGui.QFont(FONT_HEAD, int(12 * scale))); p.setPen(t.stroke)
+    p.drawText(rect.x()+int(12*scale), label_y, "AP")
+
+    # 5桁ゼロ詰めの数値（右端寄せ）
+    ap_font = QtGui.QFont(FONT_NUM, int(22*scale)); ap_font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+    p.setFont(ap_font)
+    ap_text = f"{hp:05d}"
+    rnum = QtCore.QRect(rect.x()+rect.width()-int(120*scale), num_y, int(110*scale), int(24*scale))
+    p.setPen(QtGui.QPen(QtGui.QColor(0,0,0,160), 2)); p.drawText(rnum, QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter, ap_text)
+    p.setPen(QtGui.QPen(QtGui.QColor(230,240,255), 1)); p.drawText(rnum, QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter, ap_text)
+
+    # 極細ラインバー（トラック→グロー→本体）
+    bar_x = rect.x()+int(12*scale); bar_w = rect.width()-int(24*scale); y_mid = bar_y+int(8*scale)
+    p.setPen(QtGui.QPen(QtGui.QColor(160,170,180,140), 2*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+bar_w, y_mid)
+
+    prog = int(bar_w*ratio)
+    p.setPen(QtGui.QPen(QtGui.QColor(120,170,255,70), 6*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+    p.setPen(QtGui.QPen(QtGui.QColor(220,240,255), 3*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+
+    # 低HPでアンバー点滅
+    if max_hp>0 and hp/max_hp<0.30:
+        phase=(time.time()*2.0)%1.0; alpha=0.55+0.45*(1.0 if phase<0.5 else 0.0)
+        p.setPen(QtGui.QPen(QtGui.QColor(255,160,90,int(60*alpha)), 6*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+        p.setPen(QtGui.QPen(QtGui.QColor(255,200,150,int(255*alpha)), 3*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+
+    ''' AMMO（右上テイスト）
+    p.setFont(t.font_small); p.setPen(t.stroke)
+    tY = rect.y()+int(36*scale)
+    p.drawText(rect.x()+int(12*scale), tY, "AMMO:")
+    draw_ammo_dots(p, rect.x()+int(70*scale), tY-int(12*scale),
+                   int(st.get("ammo",0)), int(st.get("max_ammo",5)), t.ammo, t.stroke, scale=1.0*scale)
+
+    '''
+    # 下辺ドット仕切り
+    draw_dotted_divider(p, rect.x()+int(12*scale), rect.y()+rect.height()-int(10*scale),
+                        rect.x()+rect.width()-int(12*scale), t.stroke, dash=4, gap=4, thick=1)
+
+
+# ── 右パネル（LINK/TIME）を描く ───────────────────────────
+def render_right_info(p, rect: QtCore.QRect, st, t, scale, match_total_sec, match_start_ts, running):
+    # 下地＋角金具
+    p.setOpacity(0.92)
+    p.setPen(QtGui.QPen(t.stroke,1)); p.setBrush(QtGui.QColor(10,12,18,200))
+    p.drawRoundedRect(rect, 8*scale, 8*scale)
+    draw_corner_brackets(p, rect.x(), rect.y(), rect.width(), rect.height(), t.stroke, len_px=14*scale, thick=2)
+    p.setOpacity(1.0)
+
+    # テキスト
+    elapsed = int(time.time()-match_start_ts) if running else 0
+    rem = max(0, match_total_sec - elapsed); mm, ss = divmod(rem, 60)
+    time_text = f"{mm:02d}:{ss:02d} / {match_total_sec//60:02d}:{match_total_sec%60:02d}"
+    conn_text = "Connected" if st.get("connected") else "Disconnected"
+    ping = st.get("ping_ms"); ping_text = f"PING {ping}ms" if ping is not None else "PING --ms"
+
+    p.setPen(t.stroke); p.setFont(t.font_small)
+    p.drawText(rect.x()+16*scale, rect.y()+26*scale, "LINK:")
+    p.drawText(rect.x()+16*scale, rect.y()+50*scale, "TIME:")
+    p.setFont(t.font_num)
+    p.drawText(rect.x()+72*scale, rect.y()+26*scale, f"{conn_text}   {ping_text}")
+    p.drawText(rect.x()+72*scale, rect.y()+50*scale, time_text)
+
+    draw_dotted_divider(p, rect.x()+12*scale, rect.y()+rect.height()-12*scale,
+                        rect.x()+rect.width()-12*scale, t.stroke, dash=4, gap=4, thick=1)
 
 
 def main():
