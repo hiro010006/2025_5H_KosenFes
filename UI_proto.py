@@ -257,6 +257,11 @@ def draw_scanlines(p: QtGui.QPainter, w, h, alpha=12):
 class MonitorWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
+        self.setStyleSheet("background:#000;")  # 念のため背景も黒
+        if self.layout():
+            self.layout().setContentsMargins(0, 0, 0, 0)
+            self.layout().setSpacing(0)
+
         self.setWindowTitle("ロボットバトル モニター")
         self.setMinimumSize(640, 360)
         self.resize(FRAME_W//2, FRAME_H//2)
@@ -279,13 +284,29 @@ class MonitorWindow(QtWidgets.QWidget):
         if self.cap: self.cap.release(); e.accept(); QtCore.QCoreApplication.quit()
 
     def keyPressEvent(self, e: QtGui.QKeyEvent):
-        if e.key()==QtCore.Qt.Key_F11: self.setWindowState(self.windowState() ^ QtCore.Qt.WindowFullScreen)
+        if e.key() == QtCore.Qt.Key_F11:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                # 余白が出ないフルスクリーン
+                self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
+                self.showFullScreen()
+            e.accept()
+            return
+            super().keyPressEvent(e)
+
         elif e.key()==QtCore.Qt.Key_Escape: self.close()
 
     def make_black_frame(self):
         return np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
 
     def update_frame(self):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        # まずウィジェット全面を黒で塗る（未描画の白フチ対策）
+        p.fillRect(self.rect(), QtGui.QColor(0, 0, 0))
+
         # 背景取得
         if self.cap:
             ret, frame = self.cap.read(); frame = self.make_black_frame() if not ret else cv2.resize(frame,(FRAME_W,FRAME_H))
@@ -389,7 +410,7 @@ def render_left_status(p, rect: QtCore.QRect, st, t, scale):
 
     # APラベル
     p.setFont(QtGui.QFont(FONT_HEAD, int(12 * scale))); p.setPen(t.stroke)
-    p.drawText(rect.x()+int(12*scale), label_y, "AP")
+    p.drawText(rect.x()+int(12*scale), label_y, "HP")
 
     # 5桁ゼロ詰めの数値（右端寄せ）
     ap_font = QtGui.QFont(FONT_NUM, int(22*scale)); ap_font.setStyleStrategy(QtGui.QFont.PreferAntialias)
