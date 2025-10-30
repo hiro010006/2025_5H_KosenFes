@@ -64,6 +64,8 @@ def safe_add_font(path: str):
         base = os.path.basename(path).lower()
         if "variablefont" in base:
             return None
+        if os.path.getsize(path) < 1024:
+            return None
         fid = QtGui.QFontDatabase.addApplicationFont(path)
         if fid == -1:
             return None
@@ -73,29 +75,42 @@ def safe_add_font(path: str):
         return None
 
 BASE_DIR = os.path.dirname(__file__)
-# ← ここを貼り替え
-FONT_HEAD = (
-    safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf"))
-    or safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Bold.ttf"))
-    or "Arial"
-)
-FONT_NUM  = (
-    safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "RobotoMono-Regular.ttf"))
-    or "Consolas"
-)
+
+# ← ここを「パス配列 + フォールバック名」に変える
+FONT_HEAD = "Arial"      # 家族名は後で差し替え
+FONT_NUM  = "Consolas"
+
+HEAD_FONT_CANDIDATES = [
+    os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf"),
+    os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Bold.ttf"),
+]
+# どこかに置いた init_fonts() の直上あたり
+NUM_FONT_CANDIDATES = [
+    os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf"),
+]
 
 
-BASE_DIR = os.path.dirname(__file__)
-FONT_HEAD = safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "Orbitron-Regular.ttf")) or "Arial"
-FONT_NUM  = safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "RobotoMono-VariableFont_wght.ttf")) or \
-            safe_add_font(os.path.join(BASE_DIR, "assets", "fonts", "RobotoMono-Regular.ttf")) or "Consolas"
+def init_fonts():
+    """QApplication生成『後』に呼ぶ。成功したら FONT_HEAD / FONT_NUM を家族名に置き換える。"""
+    global FONT_HEAD, FONT_NUM
+    for p in HEAD_FONT_CANDIDATES:
+        fam = safe_add_font(p)
+        if fam:
+            FONT_HEAD = fam
+            break
+    for p in NUM_FONT_CANDIDATES:
+        fam = safe_add_font(p)
+        if fam:
+            FONT_NUM = fam
+            break
+    print("[font] head =", FONT_HEAD, "/ num =", FONT_NUM)  # 起動時ログ
 
 # ---------------------- 設定 ----------------------
 UDP_IP = "0.0.0.0";
 UDP_PORT = 5005
 LOG_CSV = True
 LOG_FILENAME = f"match_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-RTSP_URL = None   # None=黒背景, 0=Webカメラ, "rtsp://..."=RTSP
+RTSP_URL =  None #WebカメラのURL "http://10.133.5.170:8080/stream"   # None=黒背景, 0=Webカメラ, "rtsp://..."=RTSP
 FRAME_W, FRAME_H = 1280, 720
 FPS = 30
 # -------------------------------------------------
@@ -183,6 +198,9 @@ class HUDTheme:
         self.font_body  = QtGui.QFont(FONT_HEAD, 14)
         self.font_num   = QtGui.QFont(FONT_NUM, 16)
         self.font_small = QtGui.QFont(FONT_HEAD, 12)
+        self.font_body.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, 0.5)
+        self.font_small.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, 0.5)
+
         # ペン
         self.pen_stroke = QtGui.QPen(self.stroke)
         self.pen_accent = QtGui.QPen(self.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
@@ -443,10 +461,24 @@ def render_right_info(p, rect: QtCore.QRect, st, t, scale, match_total_sec, matc
 def main():
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
     threading.Thread(target=udp_listener, args=(UDP_IP, UDP_PORT), daemon=True).start()
     if LOG_CSV:
-        threading.Thread(target=logger_worker, args=(LOG_FILENAME,), daemon=True).start(); print(f"[LOG] writing to {LOG_FILENAME}")
-    app = QtWidgets.QApplication(sys.argv); win = MonitorWindow(); win.show(); sys.exit(app.exec_())
+        threading.Thread(target=logger_worker, args=(LOG_FILENAME,), daemon=True).start()
+        print(f"[LOG] writing to {LOG_FILENAME}")
+
+    app = QtWidgets.QApplication(sys.argv)
+
+    # ★ ここでフォント登録（＝QApplication の後）
+    init_fonts()
+
+    win = MonitorWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+print("[font] head =", FONT_HEAD, "/ num =", FONT_NUM)
 
 if __name__ == "__main__":
     main()
+
+
