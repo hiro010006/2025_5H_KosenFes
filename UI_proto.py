@@ -1,7 +1,8 @@
-# robot_monitor.py
-# 要件: 映像（黒背景可）にHPバー・弾数・接続状態・試合時間・最後の被弾センサ等を重畳表示
-# UDPでJSON状態パケットを受信する（非同期スレッド）／ログをCSV出力
+# robot_monitor.py — PyQt AC-HUD 完成版（ULTRA HUD: 極細HP＋右上テイスト揃え）
+# 依存: PyQt5, numpy, opencv-python-headless
+# 起動: python robot_monitor.py（または UI_proto.py として使う場合は同名に保存）
 
+import os
 import sys
 import json
 import csv
@@ -14,395 +15,508 @@ from datetime import datetime
 import numpy as np
 import cv2
 
+# --- Qt plugin path auto-fix (before importing PyQt5) -----------------
+import os, sys, glob, importlib.util
+
+# --- マルチロボ・オート登録設定 ---
+AUTO_REGISTER = True                      # 未知のrobot_idが来たら自動登録
+DEFAULT_ROBOTS = ["R1", "R2"]             # 初期想定（空でもOK）
+ACTIVE_ROBOT = DEFAULT_ROBOTS[0]          # 画面に表示する機体
+
+def _make_blank_state(rid: str):
+    return {
+        "hp": 100, "max_hp": 100,
+        "ammo": 5, "max_ammo": 5,
+        "connected": False, "ping_ms": None,
+        "nick": rid,                 # 表示名
+        "last_seen": 0.0,
+        "hit_flash_until": 0.0,      # 被弾演出の終了時刻
+    }
+
+robot_state = { rid: _make_blank_state(rid) for rid in DEFAULT_ROBOTS }
+
+
+def _fix_qt_plugin_path():
+    # 既存の邪魔な環境変数は無効化
+    os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+    os.environ.pop("QT_PLUGIN_PATH", None)
+
+    # PyQt5 のパッケージパスを import なしで取得
+    spec = importlib.util.find_spec("PyQt5")
+    pkg_dir = None
+    if spec and spec.submodule_search_locations:
+        pkg_dir = spec.submodule_search_locations[0]
+    elif spec and spec.origin:
+        pkg_dir = os.path.dirname(spec.origin)
+    if not pkg_dir:
+        return  # PyQt5 未インストール時などは何もしない
+
+    # qwindows.dll を総当たりで探索
+    cands = glob.glob(os.path.join(pkg_dir, "**", "platforms", "qwindows.dll"), recursive=True)
+    if not cands:
+        return
+
+    plat_dir = os.path.dirname(cands[0])               # .../plugins/platforms
+    qt_root  = os.path.dirname(os.path.dirname(plat_dir))  # .../Qt5 or .../Qt
+
+    # 起動に必要な2点をProcess環境に設定
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plat_dir
+
+    bin_dir = os.path.join(qt_root, "bin")
+    if os.path.isdir(bin_dir):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+_fix_qt_plugin_path()
+# ----------------------------------------------------------------------
+
+
+# --- Qt plugin path (触らなくてもOK。wheel同梱Qtが拾える想定) ---
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-# ------------- 設定 -------------
-UDP_IP = "0.0.0.0"
+# --- Safe font loader (Qt5×可変フォント落ち対策) ---
+def safe_add_font(path: str) -> str | None:
+    try:
+        if not os.path.exists(path):
+            return None
+        # Qt5は VariableFont 系で落ちることがあるので回避
+        if "variablefont" in os.path.basename(path).lower():
+            return None
+        fid = QtGui.QFontDatabase.addApplicationFont(path)
+        if fid == -1:
+            return None
+        fams = QtGui.QFontDatabase.applicationFontFamilies(fid)
+        return fams[0] if fams else None
+    except Exception:
+        return None
+
+BASE_DIR = os.path.dirname(__file__)
+# ここを差し替え
+FONT_HEAD = "Arial"
+FONT_NUM  = "Consolas"
+
+def init_fonts():
+    """QApplication 生成後に呼び出す。Orbitron を登録して全UIに適用。"""
+    global FONT_HEAD, FONT_NUM
+    base = os.path.dirname(__file__)
+    orb  = safe_add_font(os.path.join(base, "assets", "fonts", "Orbitron-Regular.ttf"))
+    if orb:
+        FONT_HEAD = orb
+        FONT_NUM  = orb      # ← 数値もOrbitronで統一
+
+# ---------------------- 設定 ----------------------
+UDP_IP = "0.0.0.0";
 UDP_PORT = 5005
 LOG_CSV = True
 LOG_FILENAME = f"match_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-# カメラ/ストリームの指定。Noneにすると黒背景（720p）を使う。
-RTSP_URL = None  # 例: "rtsp://robot_camera/stream"
-FRAME_W = 1280
-FRAME_H = 720
+RTSP_URL = None   # None=黒背景, 0=Webカメラ, "rtsp://..."=RTSP
+FRAME_W, FRAME_H = 1280, 720
 FPS = 30
-# ---------------------------------
+# -------------------------------------------------
 
-# デフォルトステート
-state_lock = threading.Lock()
-state = {
-    "hp": 100,
-    "max_hp": 100,
-    "ammo": 5,
-    "max_ammo": 5,
-    "sensors": [0]*8,
-    "last_hit": None,
-    "ping_ms": None,
-    "connected": False,
-    "timestamp": None
-}
+# === UI表示フラグ（上パネルを一時的にオフ） ===
+SHOW_TOP_LEFT  = False
+SHOW_TOP_RIGHT = False
 
-# ログ用キュー（軽量）
 log_queue = deque(maxlen=1000)
 
-# UDP受信スレッド
+# ---------------- UDP 受信 ----------------
+
 def udp_listener(ip, port):
-    global state
+    import socket, json, time
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((ip, port))
-    sock.settimeout(1.0)
     print(f"[UDP] listening on {ip}:{port}")
     while True:
+        data, _ = sock.recvfrom(65535)
         try:
-            data, addr = sock.recvfrom(4096)
-            t_recv = time.time()
-            try:
-                text = data.decode("utf-8")
-                obj = json.loads(text)
-            except Exception as e:
-                print("[UDP] json decode error:", e)
-                continue
-            with state_lock:
-                # 例として期待するフィールドをマージ
-                for k in ("hp", "ammo", "sensors", "last_hit"):
-                    if k in obj:
-                        state[k] = obj[k]
-                state["connected"] = True
-                state["timestamp"] = t_recv
-                # ping推定（オプション: ロボット側が送信時刻を付ければ正確化可能）
-                if "sent_ts" in obj:
-                    state["ping_ms"] = int((t_recv - float(obj["sent_ts"])) * 1000)
-                else:
-                    state["ping_ms"] = None
-                # ログ登録
-                log_item = {
-                    "t": datetime.fromtimestamp(t_recv).isoformat(),
-                    "hp": state.get("hp"),
-                    "ammo": state.get("ammo"),
-                    "last_hit": state.get("last_hit")
-                }
-                log_queue.append(log_item)
-        except socket.timeout:
-            # タイムアウト → 接続状態の低下を示す
-            with state_lock:
-                # 接続切れ検出：最後の受信から1.5秒以上なら切断扱い
-                if state["timestamp"] is None or time.time() - state["timestamp"] > 1.5:
-                    state["connected"] = False
+            msg = json.loads(data.decode("utf-8"))
+        except Exception:
             continue
-        except Exception as e:
-            print("[UDP] listener error:", e)
-            time.sleep(0.5)
 
-# ログ出力スレッド
-def logger_worker(filename):
-    if not LOG_CSV:
-        return
+        rid = msg.get("robot_id")
+        if not rid:
+            continue
+
+        # 未知IDは自動登録
+        if rid not in robot_state and AUTO_REGISTER:
+            robot_state[rid] = _make_blank_state(rid)
+            print(f"[UDP] auto-registered robot '{rid}'")
+
+        if rid not in robot_state:
+            continue
+
+        rs  = robot_state[rid]
+        now = time.time()
+        typ = msg.get("type", "status")
+
+        if typ == "status":
+            rs["hp"]       = max(0, int(msg.get("hp",       rs["hp"])))
+            rs["max_hp"]   = max(1, int(msg.get("max_hp",   rs["max_hp"])))
+            rs["ammo"]     = max(0, int(msg.get("ammo",     rs["ammo"])))
+            rs["max_ammo"] = max(1, int(msg.get("max_ammo", rs["max_ammo"])))
+            rs["connected"] = bool(msg.get("connected", True))
+            rs["ping_ms"]   = msg.get("ping_ms", rs["ping_ms"])
+            rs["last_seen"] = now
+            nick = msg.get("nick")
+            if isinstance(nick, str) and nick:
+                rs["nick"] = nick
+
+        elif typ == "hit":
+            rs["hit_flash_until"] = now + 0.25
+            rs["last_seen"] = now
+
+        elif typ == "hello":
+            rs["nick"] = msg.get("nick", rs["nick"])
+            rs["connected"] = True
+            rs["last_seen"] = now
+
+
+# ---------------- ロガー ----------------
+
+def logger_worker(filename: str):
+    if not LOG_CSV: return
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["t","hp","ammo","last_hit"])
-        writer.writeheader()
+        w = csv.DictWriter(f, fieldnames=["t","hp","ammo","last_hit"])
+        w.writeheader()
         while True:
             while log_queue:
-                item = log_queue.popleft()
-                writer.writerow(item)
-                f.flush()
+                w.writerow(log_queue.popleft()); f.flush()
             time.sleep(0.2)
 
-# GUIアプリ
+# ---------------- テーマ/描画 ----------------
+class HUDTheme:
+    def __init__(self, name="ac_cyan"):
+        self.bg      = QtGui.QColor(0,0,0,255)
+        self.panel   = QtGui.QColor(12,14,18,210)
+        self.stroke  = QtGui.QColor(190,210,230,220)
+        self.hp_ok   = QtGui.QColor(80,220,140)
+        self.hp_low  = QtGui.QColor(255,88,72)
+        self.ammo    = QtGui.QColor(240,240,240)
+        self.warn    = QtGui.QColor(255,120,72)
+        self.accent  = QtGui.QColor(140,190,255)
+        self.glow    = QtGui.QColor(120,170,255,100)
+        self.shadow  = QtGui.QColor(0,0,0,160)
+        self.crosshair = QtGui.QColor(222,232,245,220)
+        # フォント
+        self.font_title = QtGui.QFont(FONT_HEAD, 18); self.font_title.setWeight(600)
+        self.font_body  = QtGui.QFont(FONT_HEAD, 14)
+        self.font_num   = QtGui.QFont(FONT_NUM, 16)
+        self.font_small = QtGui.QFont(FONT_HEAD, 12)
+        # ペン
+        self.pen_stroke = QtGui.QPen(self.stroke)
+        self.pen_accent = QtGui.QPen(self.accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+
+
+def draw_corner_brackets(p: QtGui.QPainter, x, y, w, h, color: QtGui.QColor, len_px=14, thick=2):
+    pen = QtGui.QPen(color, thick, QtCore.Qt.SolidLine, QtCore.Qt.SquareCap)
+    p.setPen(pen); p.setBrush(QtCore.Qt.NoBrush)
+    p.drawLine(x, y, x+len_px, y); p.drawLine(x, y, x, y+len_px)
+    p.drawLine(x+w-len_px, y, x+w, y); p.drawLine(x+w, y, x+w, y+len_px)
+    p.drawLine(x, y+h-len_px, x, y+h); p.drawLine(x, y+h, x+len_px, y+h)
+    p.drawLine(x+w-len_px, y+h, x+w, y+h); p.drawLine(x+w, y+h-len_px, x+w, y+h)
+
+def draw_dotted_divider(p: QtGui.QPainter, x1, y, x2, color: QtGui.QColor, dash=4, gap=4, thick=1):
+    pen = QtGui.QPen(color, thick); pen.setStyle(QtCore.Qt.CustomDashLine); pen.setDashPattern([dash,gap])
+    p.setPen(pen); p.drawLine(x1, y, x2, y)
+
+def draw_crosshair(p: QtGui.QPainter, cx, cy, size, color: QtGui.QColor, thick=2):
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.setPen(QtGui.QPen(color, thick, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    gap = int(size*0.35)
+    for dx,dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+        x1 = cx + dx*gap; y1 = cy + dy*gap; x2 = cx + dx*size; y2 = cy + dy*size
+        p.drawLine(x1,y1,x2,y2)
+
+def draw_sensor_ring(p: QtGui.QPainter, cx, cy, r, hit_idx, color_base, color_hit):
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    segs=8; base_pen = QtGui.QPen(color_base, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+    p.setPen(base_pen); RAD2QT = 180.0*16.0/np.pi
+    for i in range(segs):
+        a0 = (2*np.pi)*(i/segs); a1 = (2*np.pi)*((i+0.7)/segs)
+        start16 = int(-a0*RAD2QT); span16 = int(-(a1-a0)*RAD2QT)
+        p.setPen(base_pen); p.drawArc(cx-r, cy-r, 2*r, 2*r, start16, span16)
+        if hit_idx is not None and i == hit_idx % segs:
+            glow = QtGui.QPen(color_hit, 6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+            p.setPen(glow); p.drawArc(cx-r, cy-r, 2*r, 2*r, start16, span16)
+
+def draw_ammo_dots(p: QtGui.QPainter, x, y, count, max_count, color_fill, color_line, scale=1.0):
+    size = int(12*scale); gap = int(6*scale)
+    for i in range(max_count):
+        rect = QtCore.QRect(x + i*(size+gap), y, size, size)
+        if i < count:
+            p.setBrush(QtGui.QBrush(color_fill)); p.setPen(QtGui.QPen(QtGui.QColor(0,0,0,160), 1))
+            p.drawEllipse(rect)
+        else:
+            p.setBrush(QtCore.Qt.NoBrush); p.setPen(QtGui.QPen(color_line, 1))
+            p.drawEllipse(rect)
+
+def draw_scanlines(p: QtGui.QPainter, w, h, alpha=12):
+    p.setPen(QtCore.Qt.NoPen); p.setBrush(QtGui.QBrush(QtGui.QColor(0,0,0,alpha)))
+    for Y in range(0, h, 2): p.drawRect(0, Y, w, 1)
+
+# ---------------- メインウィンドウ ----------------
 class MonitorWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ロボットバトル モニター")
-        self.setMinimumSize(1280//2, 720//2)
+        self.setMinimumSize(640, 360)
         self.resize(FRAME_W//2, FRAME_H//2)
 
-        # ビデオ表示用ラベル
-        self.video_label = QtWidgets.QLabel()
-        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.video_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.info_label  = QtWidgets.QLabel(alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.info_label.setFixedHeight(80); self.info_label.setFont(QtGui.QFont("Arial", 11))
+        # Bottom panels と重ならないよう非表示（四隅レイアウト時）
+        self.info_label.setVisible(False)
 
-        # 情報領域（下）
-        self.info_label = QtWidgets.QLabel()
-        self.info_label.setFixedHeight(80)
-        self.info_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        font = QtGui.QFont("Arial", 11)
-        self.info_label.setFont(font)
+        v = QtWidgets.QVBoxLayout(self); v.addWidget(self.video_label,1); v.addWidget(self.info_label)
 
-        # レイアウト
-        vbox = QtWidgets.QVBoxLayout()
-        vbox.addWidget(self.video_label, stretch=1)
-        vbox.addWidget(self.info_label)
-        self.setLayout(vbox)
+        self.timer = QtCore.QTimer(self, interval=int(1000/FPS)); self.timer.timeout.connect(self.update_frame); self.timer.start()
+        self.theme = HUDTheme(); self._last_hit_seen=None
 
-        # タイマーでフレーム更新
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.timer.start(int(1000 / FPS))
+        self.cap = cv2.VideoCapture(RTSP_URL) if RTSP_URL is not None else None
+        self.match_total_sec = 3*60; self.match_start_ts = time.time(); self.match_running=True
 
-        # カメラ/ストリーム初期化（OpenCV）
-        if RTSP_URL:
-            self.cap = cv2.VideoCapture(RTSP_URL)
-        else:
-            self.cap = None  # 黒背景で描画
+    def closeEvent(self, e: QtGui.QCloseEvent):
+        if self.cap: self.cap.release(); e.accept(); QtCore.QCoreApplication.quit()
 
-        # 試合時間カウンタ（例: 3分）
-        self.match_total_sec = 3 * 60
-        self.match_start_ts = time.time()
-        self.match_running = True
+    def keyPressEvent(self, e):
+        global ACTIVE_ROBOT
+        if e.key() == QtCore.Qt.Key_1:
+            if "R1" in robot_state: ACTIVE_ROBOT = "R1"
+            e.accept(); return
+        if e.key() == QtCore.Qt.Key_2:
+            if "R2" in robot_state: ACTIVE_ROBOT = "R2"
+            e.accept(); return
+        super().keyPressEvent(e)
 
-    def closeEvent(self, event):
-        # アプリ終了時処理
-        if self.cap:
-            self.cap.release()
-        event.accept()
-        QtCore.QCoreApplication.quit()
 
     def make_black_frame(self):
         return np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
 
-    def overlay_ui(self, frame, st):
-        # frame: BGR numpy array
-        h, w = frame.shape[:2]
-        # --- HPバー ---
-        max_hp = st.get("max_hp", 100)
-        hp = max(0, min(max_hp, int(st.get("hp", 0))))
-        bar_w = int(w * 0.4)
-        bar_h = 24
-        bar_x = 20
-        bar_y = 20
-
-        # 背景長方形
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (50,50,50), -1)
-        # HP比率
-        hp_ratio = hp / float(max_hp) if max_hp>0 else 0.0
-        fill_w = int(bar_w * hp_ratio)
-        # 塗り（赤→緑的グラデーションを簡易で表現）
-        green = int(255 * hp_ratio)
-        red = int(255 * (1 - hp_ratio))
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+fill_w, bar_y+bar_h), (0, green, red), -1)
-        # 枠線・テキスト
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (200,200,200), 2)
-        cv2.putText(frame, f"HP: {hp}/{max_hp}", (bar_x+6, bar_y+bar_h-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-
-        # --- 弾数 ---
-        ammo = st.get("ammo", 0)
-        max_ammo = st.get("max_ammo", 5)
-        ammo_text = f"Ammo: {ammo}/{max_ammo}"
-        cv2.putText(frame, ammo_text, (bar_x, bar_y+bar_h+30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240,240,200), 2, cv2.LINE_AA)
-
-        # --- 接続状態／Ping ---
-        conn_text = "Connected" if st.get("connected") else "Disconnected"
-        ping = st.get("ping_ms")
-        ping_text = f"Ping: {ping} ms" if ping is not None else ""
-        cv2.putText(frame, f"{conn_text}  {ping_text}", (w-420, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
-
-        # --- 試合時間 ---
-        elapsed = int(time.time() - self.match_start_ts) if self.match_running else 0
-        remaining = max(0, self.match_total_sec - elapsed)
-        mm = remaining // 60
-        ss = remaining % 60
-        time_text = f"Time: {mm:02d}:{ss:02d} / {self.match_total_sec//60:02d}:{self.match_total_sec%60:02d}"
-        cv2.putText(frame, time_text, (w-420, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
-
-        # --- 最後の被弾センサを一瞬表示（赤い閃光） ---
-        last_hit = st.get("last_hit")
-        if last_hit is not None:
-            # センサ番号を画面周りの位置にマッピングする（例）
-            # sensor positions: 8 sensors around robot
-            cx, cy = w//2, h//2
-            radius = min(w,h)//3
-            angle = (2 * np.pi) * (last_hit / 8.0)
-            sx = int(cx + radius * np.cos(angle))
-            sy = int(cy + radius * np.sin(angle))
-            # フラッシュ（円）
-            cv2.circle(frame, (sx, sy), 40, (0,0,255), -1)
-            cv2.putText(frame, f"Hit #{last_hit}", (sx-40, sy-50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-
-        # --- フッタのログ簡易表示 ---
-        log_text = f"Last log: {st.get('timestamp') and datetime.fromtimestamp(st.get('timestamp')).strftime('%H:%M:%S')}"
-        cv2.putText(frame, log_text, (20, h-20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180,180,180), 1, cv2.LINE_AA)
-
-        return frame
-
     def update_frame(self):
-        # --- フレーム取得 ---
+        # update_frame() の冒頭で
+        st = robot_state.get(ACTIVE_ROBOT, next(iter(robot_state.values())))
+
+        # 背景取得
         if self.cap:
-            ret, frame = self.cap.read()
-            if not ret:
-                frame = self.make_black_frame()
-            else:
-                frame = cv2.resize(frame, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
+            ret, frame = self.cap.read(); frame = self.make_black_frame() if not ret else cv2.resize(frame,(FRAME_W,FRAME_H))
         else:
             frame = self.make_black_frame()
 
-        # --- 状態コピー ---
-        with state_lock:
-            st_copy = dict(state)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB); h,w,ch = rgb.shape
+        scale = 1; big_w, big_h = w*scale, h*scale
+        big_img = QtGui.QImage(big_w, big_h, QtGui.QImage.Format_ARGB32_Premultiplied); big_img.fill(QtGui.QColor(0,0,0,255))
+        p = QtGui.QPainter(big_img); p.setRenderHint(QtGui.QPainter.Antialiasing, True); p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        src_qimg = QtGui.QImage(rgb.data, w, h, ch*w, QtGui.QImage.Format_RGB888).copy(); src_qimg_big = src_qimg.scaled(big_w,big_h,QtCore.Qt.IgnoreAspectRatio,QtCore.Qt.SmoothTransformation); p.drawImage(0,0,src_qimg_big)
 
-        # --- RGB -> QImage 元画像 ---
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
+        t = self.theme
 
-        # --- スーパーサンプリング倍率（2または3を試す） ---
-        scale_factor = 2  # 2でまず試し、重ければ1に。よりシャープなら3を試す
-        big_w, big_h = w * scale_factor, h * scale_factor
+        # (disabled) 左上パネルは非表示にしました。
+# if SHOW_TOP_LEFT:
+#     # ← ここに左上パネル描画（無効化中）
+#     pass
 
-        # --- 作業用 QImage（高品質フォーマット） ---
-        # ARGB32_Premultiplied を使うことで合成品質が良くなる
-        big_img = QtGui.QImage(big_w, big_h, QtGui.QImage.Format_ARGB32_Premultiplied)
-        big_img.fill(QtGui.QColor(0, 0, 0, 255))  # 黒背景
+# (disabled) 右上パネルは非表示にしました。
+# if SHOW_TOP_RIGHT:
+#     # ← ここに右上パネル描画（無効化中）
+#     pass
 
-        painter = QtGui.QPainter(big_img)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+        # --- 四隅展開：左下・右下にも同デザインを配置 ---
+        margin = int(26 * scale)
+        left_size  = QtCore.QSize(int(w * 0.42) * scale, int(64 * scale))
+        right_size = QtCore.QSize(int(440 * scale),     int(86 * scale))
 
-        # --- 映像を大きなサイズにスムース描画 ---
-        # まず QImage を作る（コピーしておくと安全）
-        src_qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
-        src_qimg_big = src_qimg.scaled(big_w, big_h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-        painter.drawImage(0, 0, src_qimg_big)
+        rect_bl_left  = QtCore.QRect(margin, big_h - margin - left_size.height(),
+                                     left_size.width(), left_size.height())
+        rect_br_right = QtCore.QRect(big_w - margin - right_size.width(),
+                                     big_h - margin - right_size.height(),
+                                     right_size.width(), right_size.height())
 
-        # --- ベクタ描画設定（フォント） ---
-        # 環境に合わせてフォント名を変更。埋め込みが望ましければ QFontDatabase を使う。
-        font_name = "Noto Sans"  # 必要に応じて "Meiryo" や "Segoe UI" 等へ
-        hp_font_size = int(28 * scale_factor)
-        ammo_font_size = int(20 * scale_factor)
+        render_left_status(p, rect_bl_left,  st, t, scale)
+        render_right_info(p, rect_br_right, st, t, scale, self.match_total_sec, self.match_start_ts, self.match_running)
 
-        font_hp = QtGui.QFont(font_name, hp_font_size)
-        font_hp.setStyleStrategy(QtGui.QFont.PreferAntialias)
-        painter.setFont(font_hp)
+        # 未接続トースト
+        if not st.get("connected"):
+            msg = "LINK LOST — RETRYING…"; tw=int(360*scale); th=int(36*scale); tx=(big_w-tw)//2; ty=int(12*scale)
+            phase=(time.time()*1.25)%1.0; op = 0.35 + 0.35*(1.0 if phase<0.5 else 0.0)
+            p.setOpacity(op); p.setPen(QtGui.QPen(t.stroke,1)); p.setBrush(QtGui.QColor(10,12,18,210))
+            p.drawRoundedRect(tx,ty,tw,th,6*scale,6*scale)
+            draw_dotted_divider(p, tx+8*scale, ty+th-8*scale, tx+tw-8*scale, t.stroke, dash=4, gap=4, thick=1)
+            p.setOpacity(1.0); p.setFont(t.font_num); p.setPen(t.stroke)
+            p.drawText(QtCore.QRect(tx,ty,tw,th), QtCore.Qt.AlignCenter, msg)
 
-        # --- HPバー（ベクタ） ---
-        max_hp = st_copy.get("max_hp", 100)
-        hp = max(0, min(max_hp, int(st_copy.get("hp", 0))))
-        bar_w = int(w * 0.4) * scale_factor
-        bar_h = 34 * scale_factor
-        bar_x = 30 * scale_factor
-        bar_y = 30 * scale_factor
+        # ---------- 中央: 照準 & リング ----------
+        cx,cy=(w//2)*scale,(h//2)*scale; draw_crosshair(p, cx,cy, int(22*scale), t.crosshair, thick=2*scale)
+        pen_tick = QtGui.QPen(t.accent, 1*scale, QtCore.Qt.SolidLine, QtCore.Qt.SquareCap); p.setPen(pen_tick)
+        r_tick = int(min(w,h)*0.25)*scale
+        for i in range(24):
+            a = 2*np.pi*i/24; x1=cx+int((r_tick-8*scale)*np.cos(a)); y1=cy+int((r_tick-8*scale)*np.sin(a))
+            x2=cx+int(r_tick*np.cos(a)); y2=cy+int(r_tick*np.sin(a)); p.drawLine(x1,y1,x2,y2)
+        draw_sensor_ring(p, cx,cy, int(min(w,h)*0.23)*scale, st.get("last_hit"), t.accent, t.warn)
 
-        painter.setPen(QtGui.QPen(QtGui.QColor(200,200,200,220), 2 * scale_factor))
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(30,30,30,200)))
-        painter.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 8 * scale_factor, 8 * scale_factor)
+        # スキャンライン & 右下FPS
+        draw_scanlines(p, big_w, big_h, alpha=12)
+        p.setPen(t.pen_stroke); p.setFont(QtGui.QFont(FONT_NUM, int(14*scale)))
+        
+        now = time.time()
+        if st.get("hit_flash_until", 0.0) > now:
+            rem = st["hit_flash_until"] - now
+            a = max(0.0, min(1.0, rem / 0.25))
+            p.fillRect(0, 0, big_w, big_h, QtGui.QColor(255, 40, 40, int(180 * a)))
 
-        hp_ratio = (hp / float(max_hp)) if max_hp>0 else 0.0
-        grad = QtGui.QLinearGradient(bar_x, bar_y, bar_x + bar_w, bar_y)
-        grad.setColorAt(0.0, QtGui.QColor(int(255*(1-hp_ratio)), 60, 60))
-        grad.setColorAt(1.0, QtGui.QColor(60, int(255*hp_ratio), 60))
-        painter.setBrush(QtGui.QBrush(grad))
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.drawRoundedRect(bar_x, bar_y, int(bar_w * hp_ratio), bar_h, 8 * scale_factor, 8 * scale_factor)
 
-        # --- HP テキストを QPainterPath でベクタ描画（アウトライン）---
-        hp_text = f"HP: {hp}/{max_hp}"
-        path = QtGui.QPainterPath()
-        # addText の座標はベースライン位置（左下ベース）なので注意
-        text_x = bar_x + 12 * scale_factor
-        text_y = bar_y + int(bar_h * 0.72)
-        path.addText(text_x, text_y, font_hp, hp_text)
-
-        # 黒アウトライン（stroke）
-        pen_width = max(2 * scale_factor, 3)
-        painter.setPen(QtGui.QPen(QtGui.QColor(0,0,0), pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.drawPath(path)
-
-        # 白塗り本体
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(255,255,255)))
-        painter.drawPath(path)
-
-        # --- Ammo（少し小さいフォント）---
-        font_ammo = QtGui.QFont(font_name, ammo_font_size)
-        font_ammo.setStyleStrategy(QtGui.QFont.PreferAntialias)
-        painter.setFont(font_ammo)
-        ammo_text = f"Ammo: {st_copy.get('ammo',0)}/{st_copy.get('max_ammo',5)}"
-        ammo_x = bar_x
-        ammo_y = bar_y + bar_h + 36 * scale_factor
-        # draw via path for crispness
-        path2 = QtGui.QPainterPath()
-        path2.addText(ammo_x, ammo_y, font_ammo, ammo_text)
-        painter.setPen(QtGui.QPen(QtGui.QColor(0,0,0), max(2, scale_factor)))
-        painter.drawPath(path2)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(240,240,240)))
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.drawPath(path2)
-
-        # --- 接続状態・Ping（右上）---
-        painter.setFont(QtGui.QFont(font_name, int(16 * scale_factor)))
-        conn_text = "Connected" if st_copy.get("connected") else "Disconnected"
-        ping_val = st_copy.get("ping_ms")
-        ping_text = f"Ping: {ping_val} ms" if ping_val is not None else "Ping: --"
-        painter.setPen(QtGui.QPen(QtGui.QColor(220,220,220)))
-        painter.drawText(big_w - int(460 * scale_factor), int(40 * scale_factor), f"{conn_text}  {ping_text}")
-
-        # --- 最後の被弾表示（円）---
-        last_hit = st_copy.get("last_hit")
-        if last_hit is not None:
-            cx, cy = (w // 2) * scale_factor, (h // 2) * scale_factor
-            radius = int(min(w,h) * 0.22) * scale_factor
-            angle = (2 * np.pi) * (last_hit / 8.0)
-            sx = int(cx + radius * np.cos(angle))
-            sy = int(cy + radius * np.sin(angle))
-            hit_color = QtGui.QColor(255, 60, 60, 200)
-            painter.setBrush(hit_color)
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.drawEllipse(QtCore.QPoint(sx, sy), int(30 * scale_factor), int(30 * scale_factor))
-            # small white label
-            painter.setPen(QtGui.QPen(QtGui.QColor(255,255,255)))
-            painter.setFont(QtGui.QFont(font_name, int(14 * scale_factor)))
-            painter.drawText(sx - 36 * scale_factor, sy - 44 * scale_factor, f"Hit #{last_hit}")
-
-        painter.end()
-
-        # --- QImage -> QPixmap -> ラベルへ（HiDPI対応） ---
+        p.end()
         pix = QtGui.QPixmap.fromImage(big_img)
-        # Device pixel ratio をセット（UI DPI に合わせる）
-        try:
-            dpr = self.devicePixelRatioF()
-        except Exception:
-            dpr = 1.0
+        try: dpr = self.devicePixelRatioF()
+        except Exception: dpr = 1.0
         pix.setDevicePixelRatio(dpr)
-
-        final_pix = pix.scaled(
-            int(self.video_label.width() * dpr),
-            int(self.video_label.height() * dpr),
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation
-        )
-
-        # setPixmap は自動で device pixel ratio を扱う環境が多いが念のため
+        final_pix = pix.scaled(int(self.video_label.width()*dpr), int(self.video_label.height()*dpr), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.video_label.setPixmap(final_pix)
 
-        # --- info_label 更新（元の HTML 表示維持） ---
-        conn_text_short = "OK" if st_copy.get("connected") else "NO"
-        ping_str = f"{ping_val}ms" if ping_val is not None else "--"
-        info_html = (f"<b>HP</b>: {st_copy.get('hp')}/{st_copy.get('max_hp')} &nbsp;&nbsp;"
-                    f"<b>Ammo</b>: {st_copy.get('ammo')}/{st_copy.get('max_ammo')} &nbsp;&nbsp;"
-                    f"<b>Conn</b>: {conn_text_short} ({ping_str}) &nbsp;&nbsp;"
-                    f"<b>LastHit</b>: {last_hit}")
-        self.info_label.setText(info_html)
+        # 下のインフォ行（簡易）
+        conn_short = "OK" if st.get("connected") else "NO"; ping_str = f"{st.get('ping_ms')}ms" if st.get("ping_ms") is not None else "--"
+        self.info_label.setText(f"<b>HP</b>: {st.get('hp')}/{st.get('max_hp')} &nbsp;&nbsp; <b>Ammo</b>: {st.get('ammo')}/{st.get('max_ammo')} &nbsp;&nbsp; <b>Conn</b>: {conn_short} ({ping_str}) &nbsp;&nbsp; <b>LastHit</b>: {st.get('last_hit')}")
+
+# ── AC風 左パネル（APゲージ＋AMMO）を描く ─────────────────
+def render_left_status(p, rect: QtCore.QRect, st, t, scale):
+    # 下地＋角金具
+    p.setOpacity(0.92)
+    p.setPen(QtGui.QPen(t.stroke, 1)); p.setBrush(QtGui.QColor(10,12,18,200))
+    p.drawRoundedRect(rect, 8*scale, 8*scale)
+    draw_corner_brackets(p, rect.x(), rect.y(), rect.width(), rect.height(), t.stroke, len_px=14*scale, thick=2)
+    p.setOpacity(1.0)
+
+    # HP/比率
+    max_hp = st.get("max_hp", 100)
+    hp     = max(0, min(int(st.get("hp", 0)), max_hp))
+    ratio  = (hp/float(max_hp)) if max_hp>0 else 0.0
+
+    # 位置決め（“APすれすれ/数字は少し上”のやつ）
+    bar_y   = rect.y() + int(28 * scale)
+    label_y = bar_y - int(2 * scale)
+    num_y   = bar_y - int(16 * scale)
+
+    # APラベル
+    p.setFont(QtGui.QFont(FONT_HEAD, int(12 * scale))); p.setPen(t.stroke)
+    p.drawText(rect.x()+int(12*scale), label_y, "AP")
+
+    # 5桁ゼロ詰めの数値（右端寄せ）
+    ap_font = QtGui.QFont(FONT_NUM, int(22*scale)); ap_font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+    p.setFont(ap_font)
+    ap_text = f"{hp:05d}"
+    rnum = QtCore.QRect(rect.x()+rect.width()-int(120*scale), num_y, int(110*scale), int(24*scale))
+    p.setPen(QtGui.QPen(QtGui.QColor(0,0,0,160), 2)); p.drawText(rnum, QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter, ap_text)
+    p.setPen(QtGui.QPen(QtGui.QColor(230,240,255), 1)); p.drawText(rnum, QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter, ap_text)
+
+    # 極細ラインバー（トラック→グロー→本体）
+    bar_x = rect.x()+int(12*scale); bar_w = rect.width()-int(24*scale); y_mid = bar_y+int(8*scale)
+    p.setPen(QtGui.QPen(QtGui.QColor(160,170,180,140), 2*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+bar_w, y_mid)
+
+    prog = int(bar_w*ratio)
+    p.setPen(QtGui.QPen(QtGui.QColor(120,170,255,70), 6*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+    p.setPen(QtGui.QPen(QtGui.QColor(220,240,255), 3*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+
+    # 低HPでアンバー点滅
+    if max_hp>0 and hp/max_hp<0.30:
+        phase=(time.time()*2.0)%1.0; alpha=0.55+0.45*(1.0 if phase<0.5 else 0.0)
+        p.setPen(QtGui.QPen(QtGui.QColor(255,160,90,int(60*alpha)), 6*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+        p.setPen(QtGui.QPen(QtGui.QColor(255,200,150,int(255*alpha)), 3*scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        p.drawLine(bar_x, y_mid, bar_x+prog, y_mid)
+
+    # 下辺ドット仕切り
+    draw_dotted_divider(p, rect.x()+int(12*scale), rect.y()+rect.height()-int(5*scale),
+                        rect.x()+rect.width()-int(12*scale), t.stroke, dash=4, gap=4, thick=1)
+
+
+def render_right_info(p, rect: QtCore.QRect, st, t, scale, match_total_sec, match_start_ts, running):
+    # 下地
+    p.setOpacity(0.92)
+    p.setPen(QtGui.QPen(t.stroke,1)); p.setBrush(QtGui.QColor(10,12,18,200))
+    p.drawRoundedRect(rect, 8*scale, 8*scale)
+    draw_corner_brackets(p, rect.x(), rect.y(), rect.width(), rect.height(), t.stroke, len_px=14*scale, thick=2)
+    p.setOpacity(1.0)
+
+    # 上段テキスト（LINK / TIME）
+    elapsed = int(time.time()-match_start_ts) if running else 0
+    rem = max(0, match_total_sec - elapsed); mm, ss = divmod(rem, 60)
+    time_text = f"{mm:02d}:{ss:02d} / {match_total_sec//60:02d}:{match_total_sec%60:02d}"
+    conn_text = "Connected" if st.get("connected") else "Disconnected"
+    ping = st.get("ping_ms"); ping_text = f"PING {ping}ms" if ping is not None else "PING --ms"
+    
+    p.setPen(t.stroke); p.setFont(t.font_small)
+    p.drawText(rect.x()+16*scale, rect.y()+26*scale, "LINK:")
+    p.drawText(rect.x()+16*scale, rect.y()+50*scale, "TIME:")
+
+    p.setFont(QtGui.QFont(FONT_NUM,  int(13*scale)))  # ← 値（Connected / 02:28…）も小さめ
+    p.drawText(rect.x()+72*scale, rect.y()+26*scale, f"{conn_text}   {ping_text}")
+    p.drawText(rect.x()+72*scale, rect.y()+50*scale, time_text)
+
+    # --- ドット仕切り（既存） ---
+    draw_dotted_divider(
+        p,
+        rect.x() + int(12*scale),
+        rect.y() + rect.height() - int(12*scale),
+        rect.x() + rect.width() - int(12*scale),
+        t.stroke, dash=4, gap=4, thick=1
+    )
+
+    # === 下段：AMMO（左） / FPS（右）— 残弾0でAMMO点滅 ===
+    ammo = st.get("ammo"); max_ammo = st.get("max_ammo")
+    has_ammo = isinstance(ammo, int) and isinstance(max_ammo, int)
+    ammo_text = (f"AMMO  {int(ammo)}/{int(max_ammo)}") if has_ammo else "AMMO  --/--"
+
+    # フォントはOrbitron（統一）
+    p.setFont(QtGui.QFont(FONT_HEAD, int(17*scale)))  # AMMOは主役で大きめ
+
+    # 残弾0のときだけアンバー点滅（8Hzくらい）
+    if has_ammo and ammo == 0:
+        phase = (np.sin(time.time() * 8.0) * 0.5) + 0.5   # 0..1
+        p.setPen(QtGui.QPen(t.warn, 1))                   # アンバー
+        p.setOpacity(0.35 + 0.65 * phase)                 # 35〜100%
+    else:
+        p.setPen(t.pen_stroke)
+        p.setOpacity(1.0)
+
+    ammo_rect = QtCore.QRect(
+        rect.x() + int(12*scale),
+        rect.y() + rect.height() - int(28*scale),
+        int(rect.width() * 0.55),
+        int(22*scale)
+    )
+    p.drawText(ammo_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, ammo_text)
+
+    # 透過を元に戻す（他描画への副作用防止）
+    p.setOpacity(1.0)
+
+    # FPSは控えめサイズで右寄せ（必要ならサイズを t.sz_fps などで一括管理してOK）
+    p.setFont(QtGui.QFont(FONT_HEAD, int(13*scale)))
+    fps_rect = QtCore.QRect(
+        rect.x() + int(rect.width() * 0.45),
+        rect.y() + rect.height() - int(28*scale),
+        rect.width() - int(57*scale),
+        int(22*scale)
+    )
+    p.drawText(fps_rect, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{int(FPS)} FPS")
+
+
 
 
 def main():
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
-    # UDPリスナースレッド開始
-    t = threading.Thread(target=udp_listener, args=(UDP_IP, UDP_PORT), daemon=True)
-    t.start()
-
-    # ロガースレッド開始
+    threading.Thread(target=udp_listener, args=(UDP_IP, UDP_PORT), daemon=True).start()
     if LOG_CSV:
-        tlog = threading.Thread(target=logger_worker, args=(LOG_FILENAME,), daemon=True)
-        tlog.start()
+        threading.Thread(target=logger_worker, args=(LOG_FILENAME,), daemon=True).start()
         print(f"[LOG] writing to {LOG_FILENAME}")
 
     app = QtWidgets.QApplication(sys.argv)
+    init_fonts()                       # ← ここでフォント追加（QAppの後！）
+
     win = MonitorWindow()
     win.show()
     sys.exit(app.exec_())
